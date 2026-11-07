@@ -7,11 +7,16 @@
 
 ## 既存コードの配置先
 - `sts3215/robot_mapping5.py`: 地図生成・探索等
-- `Display_Process/Png/display_manager5.py`: LCD/表示管理等
+- `Display_Process/display_manager5.py`: LCD/表示管理等
 - `Display_Process/Log/Logger5.py`: ログ管理等
-- `spike/`: SPIKE Prime制御
+- `Lidar_viwer/`: LiDAR検証コード（実機と同じスペル）
+- `RoboCup_Maze_World/`: センサー・モーター・状態・マップの各モジュール
+- `MobileNetV3_1/`: 画像認識の学習・推論関連
+- `spike/`: GitHub上の将来用フォルダー。実機の提供一覧にはなし
 
-上記は配置先であり、現段階で実装本体の登録・動作確認は完了していない。
+これらはユーザー提供の実機ファイル一覧から確認したパスです。GitHubにはまだ実装本体を登録していません。
+
+[実機の全ファイル一覧](raspi5-file-tree.md) を参照してください。
 
 ## マッピングと探索（現行方針）
 - タイル: 30 × 30 cm

@@ -1,5 +1,5 @@
-# Display_Process/Log
+# ログ管理
 
-`Logger5.py` などのログ処理ソースを置く場所です。
+走行中の動作記録や不具合調査に使用するログ関連の資料です。
 
-`*.log` 等の実行ログはGit管理しません。接続情報などの機密情報もコミットしないでください。
+実機のログ処理コードの構成は[`Code/Display_Process/Log/`](../../Code/Display_Process/Log/)にまとめています。

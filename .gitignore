@@ -218,3 +218,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# TwiceHope local configuration and runtime artifacts
+.env.*
+!.env.example
+*.pem
+*.key
+*.sqlite3
+*.db
+*.sock
+*.pid
+*.swp
+*.swo
+.DS_Store
+Display_Process/Log/*.log

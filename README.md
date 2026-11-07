@@ -1,55 +1,59 @@
 # TwiceHope
 
-RoboCup Rescue Maze ロボット開発プロジェクト（2027年大会に向けた開発）
+**RoboCup Rescue Maze / Rescue World Maze** の自律走行ロボット開発リポジトリ（2027年大会に向けた開発）。
 
-## 概要
+## Raspberry Pi 5 実機の開発ディレクトリ
 
-**TwiceHope** は RoboCup Rescue Maze（Rescue World Maze）の自律走行ロボットを開発するチームです。迷路探索・地図生成・被災者認識・救助キット投下を扱います。
+実機パス: `/home/trin1/RobCup_V3/`
 
-> このリポジトリは初期構成の段階です。実機で動作する既存コードはまだ登録していません。
+提供されたファイル一覧を確認し、**211個のファイルパス**を記録しました。**完全なフォルダー・ファイル一覧は [docs/raspi5-file-tree.md](docs/raspi5-file-tree.md)** にあります。
 
-## 構成（計画）
+主な実機フォルダー:
 
-- **Raspberry Pi 5**: LiDAR・カメラの処理、マッピング、経路探索、Web/LCD表示
-- **LEGO SPIKE Prime**: モーターとセンサーの制御
-- **UART**: Raspberry Pi と SPIKE Prime の通信
-- **RPLIDAR A1M8**: 周辺の距離測定
-- **USBカメラ（左右）**: H/S/U文字と色付き被災者の認識
-- **カラーセンサー**: タイル色の判別
+- `__pycache__/`
+- `.venv/`
+- `.vscode/`
+- `camera_test/`
+- `control/`
+- `Display_Process/`
+- `imu_test/`
+- `Lidar_viwer/`
+- `MobileNetV3_1/`
+- `RoboCup_Maze_World/`
+- `sensors_test/`
+- `src/`
+- `sts3215/`
+- `test/`
+- `test_extra/`
 
-## ディレクトリ
+実機内で確認できた主要ファイル:
 
-```text
-TwiceHope/
-├── README.md
-├── .gitignore
-├── Display_Process/
-│   ├── Png/           # LCD・Web表示とdisplay_manager5関連
-│   └── Log/           # 実行ログ（*.logはGit管理対象外）
-├── sts3215/           # robot_mapping5関連
-├── spike/             # SPIKE Primeの走行制御
-└── docs/              # アーキテクチャ・開発メモ
-```
-
-> 上記は今後既存コードを格納するための配置方針です。空のフォルダーを保持するため、各フォルダーに説明用READMEを置きます。
-
-## 現行コードの配置方針
-
-既存環境とパスを合わせるため、次を基本配置とします。
-
-| 役割 | 配置先の例 |
+| 機能・用途 | 実機上の相対パス |
 | --- | --- |
-| ロボットの探索・マッピング | `sts3215/robot_mapping5.py` |
-| LCD表示管理 | `Display_Process/Png/display_manager5.py` |
-| ログ管理 | `Display_Process/Log/Logger5.py` |
-| SPIKE Prime制御 | `spike/` |
+| ロボット探索・マッピング | `sts3215/robot_mapping5.py` |
+| 表示管理 | `Display_Process/display_manager5.py` |
+| ログ処理 | `Display_Process/Log/Logger5.py` |
+| 表示PNG | `Display_Process/Png/` |
+| LiDAR検証 | `Lidar_viwer/` |
+| 機械学習・カメラ認識検証 | `MobileNetV3_1/` |
+| ロボット各機能の整理 | `RoboCup_Maze_World/` |
+| Python依存関係 | `requirements.txt` |
+| ナビゲーション資料 | `NAVIGATION.md` |
 
-※ ファイル名・拡張子は実コードを受け取ってから確認します。**上記ファイルが既にアップロードされているという意味ではありません。**
+## 主要構成
 
-## 開発上の注意
+- **Raspberry Pi 5**: LiDAR、カメラ、地図・経路探索、Web/LCD表示
+- **LEGO SPIKE Prime**: 走行/投下機構・一部センサーの制御（接続プロトコルは実機コードと照合予定）
+- **RPLIDAR A1M8**: 壁や障害物までの距離測定
+- **USBカメラ**: H/S/U文字・被災者色の認識
 
-- パスワード、Wi-Fi認証情報、トークン、秘密鍵をコミットしない
-- `.env`、実行ログ、Pythonキャッシュ、一時ファイルはGit管理から除外する
-- 実機制御コードは動作確認しながら段階的に導入する
+## リポジトリの状態
 
-詳しい構成は [docs/architecture.md](docs/architecture.md) を参照してください。
+現段階では、**実機のディレクトリ一覧と構成ドキュメントの登録まで完了**しています。Raspberry Pi内のPythonソース、画像、学習済みモデルなどの実体はまだ同期していません。既存GitHub上の `spike/` は今後の配置用メモであり、提供された実機一覧には存在しません。
+
+- [実機の全ファイル構成](docs/raspi5-file-tree.md)
+- [アーキテクチャ・開発課題](docs/architecture.md)
+
+## 安全な運用
+
+秘密鍵・パスワード・Wi-Fi接続情報・`.env`・仮想環境・ログをコミットしないでください。モーター制御に関わる変更は実機の安全対策の上で検証してください。

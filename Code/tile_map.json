@@ -1,0 +1,43 @@
+{
+  "program_version": "MS200 baseline / approach replan / complete turn then tolerance",
+  "pose": {
+    "x": 0,
+    "y": 0,
+    "heading": "N",
+    "heading_status": "UNCONFIRMED",
+    "angle_deg": 0,
+    "logical_angle_deg": 0,
+    "estimated_body_angle_deg": 0.0,
+    "partial_mm": 0.0
+  },
+  "position_mm": [
+    0.0,
+    0.0
+  ],
+  "last_motion_source": "ENCODER",
+  "heading_confirmation": null,
+  "tile_size_mm": 320.0,
+  "tiles": [
+    {
+      "x": 0,
+      "y": 0,
+      "A": 0,
+      "B": 0,
+      "C": 0,
+      "D": 0,
+      "E": 0,
+      "W": 0,
+      "S": 1,
+      "N": 0,
+      "known": {
+        "N": true,
+        "E": true,
+        "S": true,
+        "W": true
+      },
+      "visited": true
+    }
+  ],
+  "visited_count": 1,
+  "confirmed_passages": []
+}

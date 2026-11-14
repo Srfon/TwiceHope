@@ -97,9 +97,10 @@ RENDER_INTERVAL_SECONDS = 1 / WEB_FPS
 CONTROL_INTERVAL_SECONDS = 0.05
 SEGMENT_PAUSE_SECONDS = 0.5
 PROGRAM_VERSION = "MS200 baseline / FPV tile colors at 10Hz"
-DEFAULT_COLOR_CAMERA = "/dev/video2"  # Piで確認したHD USB Cameraの映像入力
+DEFAULT_COLOR_CAMERA = "/dev/video0"  # 2026-11-14実機確認済みUSBカメラ（映像入力）
 COLOR_VIEW_FORWARD_MM = 100.0  # LiDAR原点から見たカメラ視野の代表点
-COLOR_CAPTURE_INTERVAL_SECONDS = 0.1
+COLOR_CAPTURE_INTERVAL_SECONDS = 0.1  # 色判定10Hz
+CAMERA_PREVIEW_FPS = 30  # Web用ライブ表示。実機で調整可能
 FRONT_APPROACH_EXTRA_MM = 50.0  # 停止目標は固定。タイル末の近い前壁へ最大5cm接近。
 # 原点固定の報告を受け、全距離の移動量による座標更新・追加前進は既定で無効。
 ENABLE_EXPERIMENTAL_BUMP_RECOVERY = False
@@ -1771,35 +1772,50 @@ class ColorCamera:
                     "has_image": fresh and self.frame is not None}
 
     def _capture(self) -> None:
+        """USBカメラを単独所有し、色判定10HzとWeb映像30Hzを分離。"""
         cap = None
         try:
-            cap = open_color_camera(self.source, 640, 480, 30)
-            next_capture = time.monotonic()
+            cap = open_color_camera(self.source, 640, 480, CAMERA_PREVIEW_FPS)
+            next_color = 0.0
+            next_preview = 0.0
+            detections: list[dict] = []
+            stable: set[str] = set()
             failures = 0
-            while not self.stopping.wait(max(0.0, next_capture - time.monotonic())):
+            while not self.stopping.is_set():
+                # この実機では30/60fps要求を約120fpsへ丸める。
+                # grabを継続して古いフレームが溜まらないようにする。
+                if not cap.grab():
+                    failures += 1
+                    if failures >= 20:
+                        raise RuntimeError("カメラ映像を取得できません")
+                    self.stopping.wait(0.02)
+                    continue
                 stamp = time.monotonic()
-                next_capture = stamp + COLOR_CAPTURE_INTERVAL_SECONDS
-                ok, frame = cap.read()
+                if stamp < next_color and stamp < next_preview:
+                    continue
+                ok, frame = cap.retrieve()
                 if not ok or frame is None or not frame.size:
                     failures += 1
-                    with self.lock:
-                        self.history.clear()
-                        self.frame = None
-                        self.message = "カメラ映像を待機中"
                     if failures >= 20:
                         raise RuntimeError("カメラ映像を取得できません")
                     continue
                 failures = 0
-                detections = analyze_color_frame(frame, roi=self.roi)
-                with self.lock:
-                    self.history.append((stamp, {item["color"] for item in detections}))
-                    stable = set(self._stable_colors())
-                marked = annotate_color_frame(frame, detections, stable)
-                ok, jpeg = cv2.imencode(".jpg", marked, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-                with self.lock:
-                    self.message = "色判定中"
-                    self.frame = jpeg.tobytes() if ok else None
-                    self.revision += 1
+                if stamp >= next_color:
+                    detections = analyze_color_frame(frame, roi=self.roi)
+                    with self.lock:
+                        self.history.append((stamp, {item["color"] for item in detections}))
+                        stable = set(self._stable_colors())
+                    next_color = stamp + COLOR_CAPTURE_INTERVAL_SECONDS
+                if stamp >= next_preview:
+                    marked = annotate_color_frame(frame, detections, stable)
+                    encoded, jpeg = cv2.imencode(
+                        ".jpg", marked, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                    if encoded:
+                        with self.lock:
+                            self.message = "ライブ映像・色判定中"
+                            self.frame = jpeg.tobytes()
+                            self.revision += 1
+                    next_preview = stamp + 1.0 / CAMERA_PREVIEW_FPS
         except (ValueError, RuntimeError, OSError, cv2.error) as exc:
             with self.lock:
                 self.history.clear()
@@ -1809,7 +1825,6 @@ class ColorCamera:
         finally:
             if cap is not None:
                 cap.release()
-
 
 class SharedView:
     def __init__(self):
@@ -2113,7 +2128,7 @@ pre{white-space:pre-wrap;text-align:left;font-size:12px}
 <section><h3>Map</h3><canvas id='map'></canvas><p id='pose'></p>
 <p>北↑・東→ / 点線:未確認 / ○と矢印:現在地・進行方向</p><pre id='tile'></pre></section>
 <section id='color-panel' hidden><h3>USBカメラ</h3><p id='color-state'></p>
-<img id='color-image' alt='USBカメラの色検出映像' hidden style='max-width:640px'></section>
+<img id='color-image' src='/color/stream' alt='USBカメラのライブ色検出映像' hidden style='max-width:640px'></section>
 <section class='turn'><h3>旋回のHough直線比較</h3><p id='turn-error'>旋回待機中</p>
 <div class='turn-images'><figure><figcaption>旋回前</figcaption><img id='turn-before' src='/turn/before.jpg'></figure>
 <figure><figcaption>旋回後の想定</figcaption><img id='turn-expected' src='/turn/expected.jpg'></figure>
@@ -2122,7 +2137,6 @@ pre{white-space:pre-wrap;text-align:left;font-size:12px}
 let turnRevision=-1;
 const colorLabels={red:'赤',yellow:'黄',green:'緑'};
 const cameraTileColors={red:'#f44',yellow:'#ff0',green:'#4f4'};
-let colorRevision=-1;
 async function drawColors(){
  try{
  const state=await(await fetch('/color/state',{cache:'no-store'})).json();
@@ -2131,10 +2145,6 @@ async function drawColors(){
  document.getElementById('color-state').textContent=state.message+(state.colors.length?' / '+state.colors.map(c=>colorLabels[c]).join('・'):'');
  const image=document.getElementById('color-image');
  image.hidden=!state.has_image;
- if(state.has_image&&state.revision!==colorRevision){
-  image.src='/color.jpg?r='+state.revision;
-  colorRevision=state.revision;
- }
  }catch(e){}
  setTimeout(drawColors,250);
 }drawColors();
@@ -2209,6 +2219,29 @@ async function drawMap(){
             if frame is not None:
                 return Response(content=frame, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
         return Response(status_code=404, headers={"Cache-Control": "no-store"})
+
+    def camera_live_frames():
+        # カメラ実体はColorCameraだけが開く。クライアントは最新JPEGを読む。
+        last_revision = -1
+        while color_camera is not None and not color_camera.stopping.is_set():
+            with color_camera.lock:
+                revision = color_camera.revision
+                frame = color_camera.frame
+            if frame is not None and revision != last_revision:
+                last_revision = revision
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+            else:
+                time.sleep(0.015)
+
+    @app.get("/color/stream")
+    async def color_stream():
+        if color_camera is None:
+            return Response(status_code=503, content=b"USB camera disabled")
+        return StreamingResponse(
+            camera_live_frames(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate",
+                     "X-Accel-Buffering": "no"})
 
     @app.get("/turn/state")
     async def turn_state():

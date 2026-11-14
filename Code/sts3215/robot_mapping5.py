@@ -1037,6 +1037,7 @@ class TileMap:
         self.lock = threading.RLock()
         self.tiles: dict[tuple[int, int], dict] = {}
         self.pending_camera_colors: dict[tuple[int, int], list[str]] = {}
+        self.pending_camera_letters: dict[tuple[int, int], list[str]] = {}
         self.visited: set[tuple[int, int]] = set()
         # 走行によって実際に通過した隣接タイルの接続を保持する。
         # LiDARの壁スナップショットとは別の「走行実績」なので、
@@ -1084,6 +1085,9 @@ class TileMap:
         pending = self.pending_camera_colors.pop((x, y), None)
         if pending is not None:
             tile.setdefault("camera_colors", pending)
+        letters = self.pending_camera_letters.pop((x, y), None)
+        if letters is not None:
+            tile.setdefault("camera_letters", letters)
         return tile
 
     def _wall(self, x: int, y: int, direction: str, value: int) -> None:
@@ -1106,6 +1110,10 @@ class TileMap:
             tile["camera_colors"] = list(previous["camera_colors"])
         elif (x, y) in self.pending_camera_colors:
             tile["camera_colors"] = self.pending_camera_colors.pop((x, y))
+        if previous is not None and "camera_letters" in previous:
+            tile["camera_letters"] = list(previous["camera_letters"])
+        elif (x, y) in self.pending_camera_letters:
+            tile["camera_letters"] = self.pending_camera_letters.pop((x, y))
         if attributes is not None:
             for key in ("A", "B", "C", "D"):
                 if key in attributes:
@@ -1247,7 +1255,8 @@ class TileMap:
 
     def finish_forward(self, distance_mm: float, relative_walls: dict,
                        lidar_distance_mm: Optional[float] = None,
-                       camera_colors: tuple[str, ...] = ()) -> None:
+                       camera_colors: tuple[str, ...] = (),
+                       camera_letters: tuple[str, ...] = ()) -> None:
         with self.lock:
             if self._suspended:
                 return
@@ -1288,19 +1297,27 @@ class TileMap:
                     self.confirmed_passages.add(passage)
                     cursor = neighbor
             self._replace_current_observation(relative_walls)
-            if camera_colors:
+            if camera_colors or camera_letters:
+                # カメラの観測結果は暫定記録のみ。進路判断・キット投下には使わない。
                 dx, dy = self.STEPS[self.heading]
                 camera_tile = (
                     math.floor((self.position_mm[0] + dx * COLOR_VIEW_FORWARD_MM) / RUN_DISTANCE_MM + 0.5),
                     math.floor((self.position_mm[1] + dy * COLOR_VIEW_FORWARD_MM) / RUN_DISTANCE_MM + 0.5),
                 )
                 tile = self.tiles.get(camera_tile)
-                if tile is None:
-                    # 色だけ見えた未登録座標を探索用タイルには追加しない。
-                    self.pending_camera_colors.setdefault(camera_tile, list(dict.fromkeys(camera_colors)))
-                elif "camera_colors" not in tile:
-                    pending = self.pending_camera_colors.pop(camera_tile, None)
-                    tile["camera_colors"] = pending if pending is not None else list(dict.fromkeys(camera_colors))
+                for field, detected, pending_map in (
+                    ("camera_colors", camera_colors, self.pending_camera_colors),
+                    ("camera_letters", camera_letters, self.pending_camera_letters),
+                ):
+                    if not detected:
+                        continue
+                    labels = list(dict.fromkeys(detected))
+                    if tile is None:
+                        # 未登録座標を探索用タイルへ新規追加しない。
+                        pending_map.setdefault(camera_tile, labels)
+                    elif field not in tile:
+                        stored = pending_map.pop(camera_tile, None)
+                        tile[field] = stored if stored is not None else labels
             self._segment_origin = None
             self._segment_entered_tiles.clear()
             self.save()
@@ -1369,6 +1386,10 @@ class TileMap:
                 "pending_camera_colors": [
                     {"x": x, "y": y, "camera_colors": colors}
                     for (x, y), colors in self.pending_camera_colors.items()
+                ],
+                "pending_camera_letters": [
+                    {"x": x, "y": y, "camera_letters": letters}
+                    for (x, y), letters in self.pending_camera_letters.items()
                 ],
                 "visited_count": len(self.visited),
                 "confirmed_passages": [
@@ -1978,7 +1999,7 @@ function cameraFallback(reason){
  rtcPlaying=false;video.hidden=true;img.hidden=false;
  if(!img.getAttribute('src'))img.src='/color/stream';
  document.getElementById('webrtc-status').textContent='MJPEG表示: '+reason;
- if(rtcPC){rtcPC.close();rtcPC=null;}
+ const old=rtcPC;rtcPC=null;if(old)old.close();
 }
 async function startCameraWebRTC(){
  if(!window.RTCPeerConnection){cameraFallback('ブラウザ非対応');return;}
@@ -1998,7 +2019,7 @@ async function startCameraWebRTC(){
     document.getElementById('color-video').hidden=false;
     const img=document.getElementById('color-image');img.hidden=true;img.removeAttribute('src');
     status.textContent='WebRTC接続済み / 低遅延ライブ';
-   } else if(['failed','disconnected','closed'].includes(pc.connectionState)&&!rtcPlaying){
+   } else if(['failed','disconnected'].includes(pc.connectionState)){
     cameraFallback('接続に失敗');
    }
   };
@@ -2042,13 +2063,14 @@ async function drawMap(){
  const c=document.getElementById('map'),g=c.getContext('2d');
  c.width=Math.round(c.clientWidth*devicePixelRatio);c.height=Math.round(c.clientHeight*devicePixelRatio);
  const p=data.pose,tiles=data.tiles;
- const pending=data.pending_camera_colors||[],colorTiles=[...tiles,...pending];
+ const pending=data.pending_camera_colors||[],pendingLetters=data.pending_camera_letters||[];
+ const colorTiles=[...tiles,...pending,...pendingLetters];
  const xs=[0,p.x,...colorTiles.map(t=>t.x)],ys=[0,p.y,...colorTiles.map(t=>t.y)];
  const minX=Math.min(...xs)-1,maxX=Math.max(...xs)+1,minY=Math.min(...ys)-1,maxY=Math.max(...ys)+1;
  const s=Math.min(c.width/(maxX-minX+1),c.height/(maxY-minY+1));
  const ox=(c.width-s*(maxX-minX+1))/2,oy=(c.height-s*(maxY-minY+1))/2;
  const pos=(x,y)=>[ox+(x-minX)*s,oy+(maxY-y)*s];
- for(const t of pending){
+ for(const t of [...pending,...pendingLetters]){
   const color=cameraTileColors[t.camera_colors?.[0]];
   if(!color)continue;
   const [x,y]=pos(t.x,t.y);g.fillStyle=color;g.fillRect(x,y,s,s);
@@ -2065,7 +2087,8 @@ async function drawMap(){
    const a=edges[d];g.beginPath();g.moveTo(a[0],a[1]);g.lineTo(a[2],a[3]);g.stroke();
   }
   g.setLineDash([]);g.fillStyle=(color||t.A===2)?'#111':'#eee';g.font=`${Math.max(8,s*.14)}px sans-serif`;
-  g.fillText(`${t.x},${t.y}`,x+s*.1,y+s*.3);g.fillText(`B${t.B} C${t.C}`,x+s*.1,y+s*.75);
+  g.fillText(`${t.x},${t.y}`,x+s*.1,y+s*.3);
+  g.fillText(t.camera_letters?.join('')||`B${t.B} C${t.C}`,x+s*.1,y+s*.75);
  }
  const [x,y]=pos(p.x,p.y);g.setLineDash([]);g.strokeStyle='#4de2ff';g.lineWidth=3;
  const cx=x+s/2,cy=y+s/2,r=s*.27;
@@ -3842,7 +3865,9 @@ def _run_unlocked(args: argparse.Namespace, buttons: EmergencyRestartButtons,
             if stopping.is_set():
                 return
             colors = color_camera.colors_since(observed_since) if color_camera else ()
-            tile_map.finish_forward(0.0, start_walls, camera_colors=colors)
+            letters = color_camera.letters_since(observed_since) if color_camera else ()
+            tile_map.finish_forward(0.0, start_walls, camera_colors=colors,
+                                    camera_letters=letters)
             # 初期タイルの観測直後も車体の中心ずれを推定して次の進行量へ反映。
             initial_scan = lidar.snapshot()
             check_lidar(lidar, initial_scan)
@@ -4123,7 +4148,9 @@ def _run_unlocked(args: argparse.Namespace, buttons: EmergencyRestartButtons,
                 lidar_motion = estimate_forward_motion(segment_start_scan, lidar.snapshot(), travelled)
                 lidar_distance = None if lidar_motion is None else lidar_motion[0]
                 colors = color_camera.colors_since(observed_since) if color_camera else ()
-                tile_map.finish_forward(travelled, walls, lidar_distance, camera_colors=colors)
+                letters = color_camera.letters_since(observed_since) if color_camera else ()
+                tile_map.finish_forward(travelled, walls, lidar_distance,
+                                        camera_colors=colors, camera_letters=letters)
                 print(f"[NAV] STOP at {tile_map.x},{tile_map.y} after {travelled:.1f}mm")
                 # マップは停止時だけ更新。角度補正はその後の独立した
                 # 全距離LiDAR測定で行い、走行中の制御には一切混ぜない。

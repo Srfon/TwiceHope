@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from collections import deque
 import json
 import math
@@ -25,10 +26,11 @@ import cv2
 import numpy as np
 import serial
 import uvicorn
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse, StreamingResponse
 
 from sts3215 import STS3215
+from camera import ColorCamera, COLOR_BGR  # single-owner USB camera + OCR + WebRTC frames
 
 # Import the currently deployed PNG mirror module from project root.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -96,10 +98,9 @@ POINT_LIFETIME_SECONDS = 0.35
 RENDER_INTERVAL_SECONDS = 1 / WEB_FPS
 CONTROL_INTERVAL_SECONDS = 0.05
 SEGMENT_PAUSE_SECONDS = 0.5
-PROGRAM_VERSION = "MS200 baseline / FPV tile colors at 10Hz"
-DEFAULT_COLOR_CAMERA = "/dev/video2"  # Piで確認したHD USB Cameraの映像入力
+PROGRAM_VERSION = "MS200 / USB camera color+HSU / WebRTC live"
+DEFAULT_COLOR_CAMERA = "/dev/video0"  # 2026-11-14実機確認済みUSBカメラ（映像入力）
 COLOR_VIEW_FORWARD_MM = 100.0  # LiDAR原点から見たカメラ視野の代表点
-COLOR_CAPTURE_INTERVAL_SECONDS = 0.1
 FRONT_APPROACH_EXTRA_MM = 50.0  # 停止目標は固定。タイル末の近い前壁へ最大5cm接近。
 # 原点固定の報告を受け、全距離の移動量による座標更新・追加前進は既定で無効。
 ENABLE_EXPERIMENTAL_BUMP_RECOVERY = False
@@ -1036,6 +1037,7 @@ class TileMap:
         self.lock = threading.RLock()
         self.tiles: dict[tuple[int, int], dict] = {}
         self.pending_camera_colors: dict[tuple[int, int], list[str]] = {}
+        self.pending_camera_letters: dict[tuple[int, int], list[str]] = {}
         self.visited: set[tuple[int, int]] = set()
         # 走行によって実際に通過した隣接タイルの接続を保持する。
         # LiDARの壁スナップショットとは別の「走行実績」なので、
@@ -1083,6 +1085,9 @@ class TileMap:
         pending = self.pending_camera_colors.pop((x, y), None)
         if pending is not None:
             tile.setdefault("camera_colors", pending)
+        letters = self.pending_camera_letters.pop((x, y), None)
+        if letters is not None:
+            tile.setdefault("camera_letters", letters)
         return tile
 
     def _wall(self, x: int, y: int, direction: str, value: int) -> None:
@@ -1105,6 +1110,10 @@ class TileMap:
             tile["camera_colors"] = list(previous["camera_colors"])
         elif (x, y) in self.pending_camera_colors:
             tile["camera_colors"] = self.pending_camera_colors.pop((x, y))
+        if previous is not None and "camera_letters" in previous:
+            tile["camera_letters"] = list(previous["camera_letters"])
+        elif (x, y) in self.pending_camera_letters:
+            tile["camera_letters"] = self.pending_camera_letters.pop((x, y))
         if attributes is not None:
             for key in ("A", "B", "C", "D"):
                 if key in attributes:
@@ -1246,7 +1255,8 @@ class TileMap:
 
     def finish_forward(self, distance_mm: float, relative_walls: dict,
                        lidar_distance_mm: Optional[float] = None,
-                       camera_colors: tuple[str, ...] = ()) -> None:
+                       camera_colors: tuple[str, ...] = (),
+                       camera_letters: tuple[str, ...] = ()) -> None:
         with self.lock:
             if self._suspended:
                 return
@@ -1287,19 +1297,27 @@ class TileMap:
                     self.confirmed_passages.add(passage)
                     cursor = neighbor
             self._replace_current_observation(relative_walls)
-            if camera_colors:
+            if camera_colors or camera_letters:
+                # カメラの観測結果は暫定記録のみ。進路判断・キット投下には使わない。
                 dx, dy = self.STEPS[self.heading]
                 camera_tile = (
                     math.floor((self.position_mm[0] + dx * COLOR_VIEW_FORWARD_MM) / RUN_DISTANCE_MM + 0.5),
                     math.floor((self.position_mm[1] + dy * COLOR_VIEW_FORWARD_MM) / RUN_DISTANCE_MM + 0.5),
                 )
                 tile = self.tiles.get(camera_tile)
-                if tile is None:
-                    # 色だけ見えた未登録座標を探索用タイルには追加しない。
-                    self.pending_camera_colors.setdefault(camera_tile, list(dict.fromkeys(camera_colors)))
-                elif "camera_colors" not in tile:
-                    pending = self.pending_camera_colors.pop(camera_tile, None)
-                    tile["camera_colors"] = pending if pending is not None else list(dict.fromkeys(camera_colors))
+                for field, detected, pending_map in (
+                    ("camera_colors", camera_colors, self.pending_camera_colors),
+                    ("camera_letters", camera_letters, self.pending_camera_letters),
+                ):
+                    if not detected:
+                        continue
+                    labels = list(dict.fromkeys(detected))
+                    if tile is None:
+                        # 未登録座標を探索用タイルへ新規追加しない。
+                        pending_map.setdefault(camera_tile, labels)
+                    elif field not in tile:
+                        stored = pending_map.pop(camera_tile, None)
+                        tile[field] = stored if stored is not None else labels
             self._segment_origin = None
             self._segment_entered_tiles.clear()
             self.save()
@@ -1368,6 +1386,10 @@ class TileMap:
                 "pending_camera_colors": [
                     {"x": x, "y": y, "camera_colors": colors}
                     for (x, y), colors in self.pending_camera_colors.items()
+                ],
+                "pending_camera_letters": [
+                    {"x": x, "y": y, "camera_letters": letters}
+                    for (x, y), letters in self.pending_camera_letters.items()
                 ],
                 "visited_count": len(self.visited),
                 "confirmed_passages": [
@@ -1649,167 +1671,8 @@ def estimate_forward_motion(reference: Scan, current: Scan,
     return best_distance, measured_rotation
 
 
-# Color detection from robocup_usb_color.py.
-# OpenCV hue is 0..179, saturation/value 0..255.
-COLOR_HSV_BANDS = {
-    "red": ((0, 12), (170, 179)),  # wraps across hue=0
-    "yellow": ((18, 35),),
-    "green": ((38, 85),),
-}
-COLOR_BGR = {"red": (0, 0, 255), "yellow": (0, 255, 255), "green": (0, 255, 0)}
-COLOR_MORPH_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-
-
-def analyze_color_frame(
-    frame: np.ndarray,
-    *,
-    min_area: int = 350,
-    min_saturation: int = 85,
-    min_value: int = 60,
-    roi: tuple[float, float, float, float] = (0.0, 0.0, 1.0, 1.0),
-) -> list[dict]:
-    """Return detections with color, area(px^2), bbox(x,y,w,h), center(x,y).
-
-    The largest connected region is kept per color. A color may be reported
-    alongside others. ROI coordinates are fractional positions in the image.
-    """
-    if frame is None or frame.size == 0:
-        return []
-    height, width = frame.shape[:2]
-    rx1, ry1, rx2, ry2 = roi
-    x1, y1 = int(width * rx1), int(height * ry1)
-    x2, y2 = int(width * rx2), int(height * ry2)
-    if x2 <= x1 or y2 <= y1:
-        raise ValueError("Invalid ROI")
-    subframe = frame[y1:y2, x1:x2]
-    hsv = cv2.cvtColor(subframe, cv2.COLOR_BGR2HSV)
-    results: list[dict] = []
-    for color, ranges in COLOR_HSV_BANDS.items():
-        mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        for hue_lo, hue_hi in ranges:
-            mask = cv2.bitwise_or(mask, cv2.inRange(
-                hsv,
-                (hue_lo, min_saturation, min_value),
-                (hue_hi, 255, 255),
-            ))
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, COLOR_MORPH_KERNEL)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, COLOR_MORPH_KERNEL)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
-        largest = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(largest)
-        if area < min_area:
-            continue
-        bx, by, bw, bh = cv2.boundingRect(largest)
-        results.append({
-            "color": color,
-            "area": int(round(area)),
-            "bbox": [bx + x1, by + y1, bw, bh],
-            "center": [bx + x1 + bw // 2, by + y1 + bh // 2],
-        })
-    return sorted(results, key=lambda d: d["area"], reverse=True)
-
-
-def annotate_color_frame(frame: np.ndarray, results: list[dict], stable: set) -> np.ndarray:
-    image = frame.copy()
-    for d in results:
-        x, y, w, h = d["bbox"]
-        color = d["color"]
-        cv2.rectangle(image, (x, y), (x + w, y + h), COLOR_BGR[color], 2)
-        label = f"{color.upper()} {d['area']}px" + (" OK" if color in stable else "")
-        cv2.putText(image, label, (x, max(20, y - 6)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLOR_BGR[color], 2)
-    return image
-
-
-def open_color_camera(source: str, width: int, height: int, fps: int) -> cv2.VideoCapture:
-    device = source if source.startswith("/dev/") else int(source)
-    cap = cv2.VideoCapture(device, cv2.CAP_V4L2)
-    if not cap.isOpened():
-        cap.release()
-        raise RuntimeError(f"Camera could not be opened: {source}")
-    # MJPG may reduce USB bandwidth. Unsupported settings are simply ignored.
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS, fps)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    return cap
-
-
-class ColorCamera:
-    """USBカメラを単独所有し、画像と確定色を走行処理へ非同期で渡す。"""
-
-    def __init__(self, source: str, roi: tuple[float, float, float, float]):
-        self.source = source
-        self.roi = roi
-        self.lock = threading.Lock()
-        self.stopping = threading.Event()
-        self.history: deque[tuple[float, set[str]]] = deque(maxlen=7)
-        self.message = "カメラ起動中"
-        self.frame: Optional[bytes] = None
-        self.revision = 0
-        self.thread = threading.Thread(target=self._capture, name="usb-color-camera", daemon=True)
-
-    def _stable_colors(self, since: float = 0.0) -> tuple[str, ...]:
-        cutoff = max(since, time.monotonic() - 1.0)
-        samples = [colors for stamp, colors in self.history if stamp >= cutoff]
-        votes = {color: sum(color in sample for sample in samples) for color in COLOR_HSV_BANDS}
-        confirmed = (color for color, count in votes.items() if count >= 5)
-        return tuple(sorted(confirmed, key=votes.__getitem__, reverse=True))
-
-    def colors_since(self, since: float) -> tuple[str, ...]:
-        with self.lock:
-            return self._stable_colors(since)
-
-    def snapshot(self) -> dict:
-        with self.lock:
-            fresh = bool(self.history and time.monotonic() - self.history[-1][0] <= 1.0)
-            return {"message": self.message if fresh or not self.history else "カメラ映像を待機中",
-                    "colors": self._stable_colors(), "revision": self.revision,
-                    "has_image": fresh and self.frame is not None}
-
-    def _capture(self) -> None:
-        cap = None
-        try:
-            cap = open_color_camera(self.source, 640, 480, 30)
-            next_capture = time.monotonic()
-            failures = 0
-            while not self.stopping.wait(max(0.0, next_capture - time.monotonic())):
-                stamp = time.monotonic()
-                next_capture = stamp + COLOR_CAPTURE_INTERVAL_SECONDS
-                ok, frame = cap.read()
-                if not ok or frame is None or not frame.size:
-                    failures += 1
-                    with self.lock:
-                        self.history.clear()
-                        self.frame = None
-                        self.message = "カメラ映像を待機中"
-                    if failures >= 20:
-                        raise RuntimeError("カメラ映像を取得できません")
-                    continue
-                failures = 0
-                detections = analyze_color_frame(frame, roi=self.roi)
-                with self.lock:
-                    self.history.append((stamp, {item["color"] for item in detections}))
-                    stable = set(self._stable_colors())
-                marked = annotate_color_frame(frame, detections, stable)
-                ok, jpeg = cv2.imencode(".jpg", marked, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-                with self.lock:
-                    self.message = "色判定中"
-                    self.frame = jpeg.tobytes() if ok else None
-                    self.revision += 1
-        except (ValueError, RuntimeError, OSError, cv2.error) as exc:
-            with self.lock:
-                self.history.clear()
-                self.frame = None
-                self.message = f"カメラエラー {exc}"
-            print(f"[COLOR CAMERA] {self.source}: {exc}", flush=True)
-        finally:
-            if cap is not None:
-                cap.release()
-
+# Camera capture / recognition now live in camera.py.
+# This module retains only mapping / motion / Web presentation.
 
 class SharedView:
     def __init__(self):
@@ -2089,8 +1952,16 @@ def lcd_mirror_loop(view: SharedView, stopping: threading.Event,
         stopping.wait(max(0.0, 1 / fps - (time.monotonic() - began)))
 
 
-def start_web(view: SharedView, port: int, color_camera: Optional[ColorCamera] = None) -> uvicorn.Server:
+def start_web(view: SharedView, port: int, color_camera: Optional[ColorCamera] = None,
+              webrtc_fps: int = 30) -> uvicorn.Server:
     app = FastAPI()
+    web_rtc_peers = set()
+
+    @app.on_event("shutdown")
+    async def close_web_rtc_peers():
+        if web_rtc_peers:
+            await asyncio.gather(*(pc.close() for pc in list(web_rtc_peers)), return_exceptions=True)
+            web_rtc_peers.clear()
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
@@ -2112,29 +1983,77 @@ pre{white-space:pre-wrap;text-align:left;font-size:12px}
 <section><h3>LiDAR</h3><img src='/stream' onerror="this.src='/stream?t='+Date.now()"></section>
 <section><h3>Map</h3><canvas id='map'></canvas><p id='pose'></p>
 <p>北↑・東→ / 点線:未確認 / ○と矢印:現在地・進行方向</p><pre id='tile'></pre></section>
-<section id='color-panel' hidden><h3>USBカメラ</h3><p id='color-state'></p>
-<img id='color-image' alt='USBカメラの色検出映像' hidden style='max-width:640px'></section>
+<section id='color-panel' hidden><h3>USBカメラ / LIVE</h3><p id='color-state'></p>
+<p id='webrtc-status' style='font-size:12px;color:#9db1c9'>WebRTC準備中</p>
+<video id='color-video' autoplay muted playsinline hidden style='width:100%;max-width:640px;aspect-ratio:4/3;object-fit:contain'></video>
+<img id='color-image' alt='USBカメラのライブ映像（MJPEG代替）' hidden style='max-width:640px'></section>
 <section class='turn'><h3>旋回のHough直線比較</h3><p id='turn-error'>旋回待機中</p>
 <div class='turn-images'><figure><figcaption>旋回前</figcaption><img id='turn-before' src='/turn/before.jpg'></figure>
 <figure><figcaption>旋回後の想定</figcaption><img id='turn-expected' src='/turn/expected.jpg'></figure>
 <figure><figcaption>旋回後の実測</figcaption><img id='turn-after' src='/turn/after.jpg'></figure></div></section></main>
 <script>
 let turnRevision=-1;
+let rtcAttempted=false, rtcPlaying=false, rtcPC=null;
+function cameraFallback(reason){
+ const img=document.getElementById('color-image'),video=document.getElementById('color-video');
+ rtcPlaying=false;video.hidden=true;img.hidden=false;
+ if(!img.getAttribute('src'))img.src='/color/stream';
+ document.getElementById('webrtc-status').textContent='MJPEG表示: '+reason;
+ const old=rtcPC;rtcPC=null;if(old)old.close();
+}
+async function startCameraWebRTC(){
+ if(!window.RTCPeerConnection){cameraFallback('ブラウザ非対応');return;}
+ try{
+  const pc=new RTCPeerConnection({iceServers:[]});rtcPC=pc;
+  const status=document.getElementById('webrtc-status');
+  status.textContent='WebRTC接続中...';
+  pc.addTransceiver('video',{direction:'recvonly'});
+  pc.ontrack=(event)=>{
+   const video=document.getElementById('color-video');
+   video.srcObject=event.streams[0]||new MediaStream([event.track]);
+   video.play().catch(()=>{});
+  };
+  pc.onconnectionstatechange=()=>{
+   if(pc.connectionState==='connected'){
+    rtcPlaying=true;
+    document.getElementById('color-video').hidden=false;
+    const img=document.getElementById('color-image');img.hidden=true;img.removeAttribute('src');
+    status.textContent='WebRTC接続済み / 低遅延ライブ';
+   } else if(['failed','disconnected'].includes(pc.connectionState)){
+    cameraFallback('接続に失敗');
+   }
+  };
+  await pc.setLocalDescription(await pc.createOffer());
+  if(pc.iceGatheringState!=='complete'){
+   await new Promise(resolve=>{
+    const t=setTimeout(resolve,4000);
+    const onChange=()=>{if(pc.iceGatheringState==='complete'){
+      clearTimeout(t);pc.removeEventListener('icegatheringstatechange',onChange);resolve();}};
+    pc.addEventListener('icegatheringstatechange',onChange);
+   });
+  }
+  const response=await fetch('/color/webrtc/offer',{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({sdp:pc.localDescription.sdp,type:pc.localDescription.type})});
+  if(!response.ok)throw new Error('HTTP '+response.status);
+  await pc.setRemoteDescription(await response.json());
+  setTimeout(()=>{if(!rtcPlaying)cameraFallback('タイムアウト')},8000);
+ }catch(e){cameraFallback(String(e.message||e));}
+}
+window.addEventListener('beforeunload',()=>{if(rtcPC)rtcPC.close()});
 const colorLabels={red:'赤',yellow:'黄',green:'緑'};
 const cameraTileColors={red:'#f44',yellow:'#ff0',green:'#4f4'};
-let colorRevision=-1;
 async function drawColors(){
  try{
  const state=await(await fetch('/color/state',{cache:'no-store'})).json();
  if(!state)return;
  document.getElementById('color-panel').hidden=false;
- document.getElementById('color-state').textContent=state.message+(state.colors.length?' / '+state.colors.map(c=>colorLabels[c]).join('・'):'');
- const image=document.getElementById('color-image');
- image.hidden=!state.has_image;
- if(state.has_image&&state.revision!==colorRevision){
-  image.src='/color.jpg?r='+state.revision;
-  colorRevision=state.revision;
- }
+ document.getElementById('color-state').textContent=state.message+
+  ' / '+(state.fps||0)+'fps'+
+  (state.colors.length?' / 色:'+state.colors.map(c=>colorLabels[c]).join('・'):'')+
+  (state.letters?.length?' / HSU:'+state.letters.join(','):'')+
+  ' / '+(state.ocr_status||'');
+ if(state.has_image&&!rtcAttempted){rtcAttempted=true;startCameraWebRTC();}
  }catch(e){}
  setTimeout(drawColors,250);
 }drawColors();
@@ -2144,13 +2063,14 @@ async function drawMap(){
  const c=document.getElementById('map'),g=c.getContext('2d');
  c.width=Math.round(c.clientWidth*devicePixelRatio);c.height=Math.round(c.clientHeight*devicePixelRatio);
  const p=data.pose,tiles=data.tiles;
- const pending=data.pending_camera_colors||[],colorTiles=[...tiles,...pending];
+ const pending=data.pending_camera_colors||[],pendingLetters=data.pending_camera_letters||[];
+ const colorTiles=[...tiles,...pending,...pendingLetters];
  const xs=[0,p.x,...colorTiles.map(t=>t.x)],ys=[0,p.y,...colorTiles.map(t=>t.y)];
  const minX=Math.min(...xs)-1,maxX=Math.max(...xs)+1,minY=Math.min(...ys)-1,maxY=Math.max(...ys)+1;
  const s=Math.min(c.width/(maxX-minX+1),c.height/(maxY-minY+1));
  const ox=(c.width-s*(maxX-minX+1))/2,oy=(c.height-s*(maxY-minY+1))/2;
  const pos=(x,y)=>[ox+(x-minX)*s,oy+(maxY-y)*s];
- for(const t of pending){
+ for(const t of [...pending,...pendingLetters]){
   const color=cameraTileColors[t.camera_colors?.[0]];
   if(!color)continue;
   const [x,y]=pos(t.x,t.y);g.fillStyle=color;g.fillRect(x,y,s,s);
@@ -2167,7 +2087,8 @@ async function drawMap(){
    const a=edges[d];g.beginPath();g.moveTo(a[0],a[1]);g.lineTo(a[2],a[3]);g.stroke();
   }
   g.setLineDash([]);g.fillStyle=(color||t.A===2)?'#111':'#eee';g.font=`${Math.max(8,s*.14)}px sans-serif`;
-  g.fillText(`${t.x},${t.y}`,x+s*.1,y+s*.3);g.fillText(`B${t.B} C${t.C}`,x+s*.1,y+s*.75);
+  g.fillText(`${t.x},${t.y}`,x+s*.1,y+s*.3);
+  g.fillText(t.camera_letters?.join('')||`B${t.B} C${t.C}`,x+s*.1,y+s*.75);
  }
  const [x,y]=pos(p.x,p.y);g.setLineDash([]);g.strokeStyle='#4de2ff';g.lineWidth=3;
  const cx=x+s/2,cy=y+s/2,r=s*.27;
@@ -2209,6 +2130,73 @@ async function drawMap(){
             if frame is not None:
                 return Response(content=frame, media_type="image/jpeg", headers={"Cache-Control": "no-store"})
         return Response(status_code=404, headers={"Cache-Control": "no-store"})
+
+    def camera_live_frames():
+        # カメラ実体はColorCameraだけが開く。クライアントは最新JPEGを読む。
+        last_revision = -1
+        while color_camera is not None and not color_camera.stopping.is_set():
+            with color_camera.lock:
+                revision = color_camera.revision
+                frame = color_camera.frame
+            if frame is not None and revision != last_revision:
+                last_revision = revision
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+            else:
+                time.sleep(0.015)
+
+    @app.get("/color/stream")
+    async def color_stream():
+        if color_camera is None:
+            return Response(status_code=503, content=b"USB camera disabled")
+        return StreamingResponse(
+            camera_live_frames(),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+            headers={"Cache-Control": "no-store, no-cache, must-revalidate",
+                     "X-Accel-Buffering": "no"})
+
+    @app.post("/color/webrtc/offer")
+    async def camera_webrtc_offer(request: Request):
+        if color_camera is None or color_camera.get_raw_frame() is None:
+            return Response(status_code=503, content="USB camera not ready")
+        try:
+            from aiortc import RTCPeerConnection, RTCSessionDescription, RTCRtpSender
+        except ImportError:
+            return Response(status_code=503, content="aiortc is not installed")
+        try:
+            offer = await request.json()
+            if (offer.get("type") != "offer" or not isinstance(offer.get("sdp"), str)
+                    or len(offer["sdp"]) > 131072):
+                return Response(status_code=400, content="Invalid SDP offer")
+            pc = RTCPeerConnection()
+            web_rtc_peers.add(pc)
+
+            @pc.on("connectionstatechange")
+            async def on_connection_state_change():
+                if pc.connectionState in ("failed", "closed"):
+                    await pc.close()
+                    web_rtc_peers.discard(pc)
+
+            try:
+                await pc.setRemoteDescription(
+                    RTCSessionDescription(sdp=offer["sdp"], type=offer["type"]))
+                sender = pc.addTrack(color_camera.new_video_track(webrtc_fps))
+                h264 = [codec for codec in RTCRtpSender.getCapabilities("video").codecs
+                        if codec.mimeType.lower() == "video/h264"]
+                if h264:
+                    for transceiver in pc.getTransceivers():
+                        if transceiver.sender is sender:
+                            transceiver.setCodecPreferences(h264)
+                            break
+                answer = await pc.createAnswer()
+                await pc.setLocalDescription(answer)
+            except Exception:
+                await pc.close()
+                web_rtc_peers.discard(pc)
+                raise
+            return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+        except Exception as exc:
+            print(f"[WEBRTC] handshake error: {exc}", flush=True)
+            return Response(status_code=400, content="WebRTC negotiation failed")
 
     @app.get("/turn/state")
     async def turn_state():
@@ -3759,8 +3747,10 @@ def run(args: argparse.Namespace) -> None:
         buttons = EmergencyRestartButtons()
         try:
             if args.color_camera is not None:
-                color_camera = ColorCamera(args.color_camera, tuple(args.color_roi))
-                color_camera.thread.start()
+                color_camera = ColorCamera(args.color_camera, tuple(args.color_roi),
+                                           preview_fps=args.camera_fps,
+                                           ocr_enabled=not args.no_ocr)
+                color_camera.start()
             restarting = False
             while True:
                 if restarting:
@@ -3788,9 +3778,7 @@ def run(args: argparse.Namespace) -> None:
             buttons.close()
     finally:
         if color_camera is not None:
-            color_camera.stopping.set()
-            if color_camera.thread.ident is not None:
-                color_camera.thread.join(timeout=2.0)
+            color_camera.stop()
         instance_lock.close()
 
 
@@ -3835,7 +3823,7 @@ def _run_unlocked(args: argparse.Namespace, buttons: EmergencyRestartButtons,
     segment_start_scan: Optional[Scan] = None
     start_lateral_error_mm = 0.0
     try:
-        server = start_web(view, args.web_port, color_camera)
+        server = start_web(view, args.web_port, color_camera, args.webrtc_fps)
         if args.lcd_mode != "off":
             lcd_thread = threading.Thread(
                 target=lcd_mirror_loop,
@@ -3877,7 +3865,9 @@ def _run_unlocked(args: argparse.Namespace, buttons: EmergencyRestartButtons,
             if stopping.is_set():
                 return
             colors = color_camera.colors_since(observed_since) if color_camera else ()
-            tile_map.finish_forward(0.0, start_walls, camera_colors=colors)
+            letters = color_camera.letters_since(observed_since) if color_camera else ()
+            tile_map.finish_forward(0.0, start_walls, camera_colors=colors,
+                                    camera_letters=letters)
             # 初期タイルの観測直後も車体の中心ずれを推定して次の進行量へ反映。
             initial_scan = lidar.snapshot()
             check_lidar(lidar, initial_scan)
@@ -4158,7 +4148,9 @@ def _run_unlocked(args: argparse.Namespace, buttons: EmergencyRestartButtons,
                 lidar_motion = estimate_forward_motion(segment_start_scan, lidar.snapshot(), travelled)
                 lidar_distance = None if lidar_motion is None else lidar_motion[0]
                 colors = color_camera.colors_since(observed_since) if color_camera else ()
-                tile_map.finish_forward(travelled, walls, lidar_distance, camera_colors=colors)
+                letters = color_camera.letters_since(observed_since) if color_camera else ()
+                tile_map.finish_forward(travelled, walls, lidar_distance,
+                                        camera_colors=colors, camera_letters=letters)
                 print(f"[NAV] STOP at {tile_map.x},{tile_map.y} after {travelled:.1f}mm")
                 # マップは停止時だけ更新。角度補正はその後の独立した
                 # 全距離LiDAR測定で行い、走行中の制御には一切混ぜない。
@@ -4271,6 +4263,12 @@ def parse_args() -> argparse.Namespace:
                               help=f"赤・黄・緑の検出用FPVカメラ（既定 {DEFAULT_COLOR_CAMERA}）")
     camera_group.add_argument("--no-color-camera", dest="color_camera", action="store_const", const=None,
                               help="カメラの映像取得と色検出を無効にする")
+    parser.add_argument("--camera-fps", type=int, choices=(15, 20, 30, 60), default=30,
+                        help="USB撮影とMJPEG目標FPS（初期値30）")
+    parser.add_argument("--webrtc-fps", type=int, choices=(15, 30, 60), default=30,
+                        help="WebRTC送信目標FPS（初期値30）")
+    parser.add_argument("--no-ocr", action="store_true",
+                        help="試験用H/S/U文字認識を無効化する（色認識は有効）")
     parser.add_argument("--color-roi", type=float, nargs=4, default=(0, 0, 1, 1),
                         metavar=("X1", "Y1", "X2", "Y2"), help="色検出範囲を画像内の0〜1で指定")
     # Normal startup initializes motors. --view-only is retained as an explicit safe override.

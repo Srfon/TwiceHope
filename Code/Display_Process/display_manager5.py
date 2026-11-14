@@ -80,11 +80,18 @@ LOG_LEVELS = ("INFO", "DEBUG", "NOTICE", "WARNING", "WARN", "ERROR", "ERR")
 # GPIO22: robot_mapping5.py が停止中だけ2秒長押しで起動
 # ============================================================
 ROBOT_SCRIPT = Path(os.environ.get(
-    "ROBOT_SCRIPT", "/home/trin1/RobCup_V3/sts3215/robot_mapping5_2.py"))
+    "ROBOT_SCRIPT", "/home/trin1/RobCup_V3/sts3215/robot_mapping5.py"))
 ROBOT_PYTHON = Path(os.environ.get(
     "ROBOT_PYTHON", "/home/trin1/RobCup_V3/.venv/bin/python"))
 ROBOT_ROOT = ROBOT_SCRIPT.parent.parent
 ROBOT_LOCK_FILE = Path("/tmp/robocup_robot_mapping5.lock")
+# ボタン起動でも手動確認で動いた設定を使う。8000番は別Pythonが使用中。
+ROBOT_WEB_PORT = os.environ.get("ROBOT_WEB_PORT", "8010")
+ROBOT_CAMERA_DEVICE = os.environ.get("ROBOT_CAMERA_DEVICE", "/dev/video0")
+ROBOT_CAMERA_FPS = os.environ.get("ROBOT_CAMERA_FPS", "30")
+ROBOT_WEBRTC_FPS = os.environ.get("ROBOT_WEBRTC_FPS", "30")
+# 実機で表示確認済みの --no-ocr を既定にする。OCRは明示的に有効化。
+ROBOT_CAMERA_OCR = os.environ.get("ROBOT_CAMERA_OCR", "0") == "1"
 BUTTON1_PIN = 22
 # GPIO22はdisplay_managerのみが確保。起動中のロボットへ押下をUNIX datagramで転送。
 ROBOT_BUTTON_SOCKET = Path(os.environ.get("ROBOT_BUTTON_SOCKET", "/dev/shm/robocup_gpio22_press.sock"))
@@ -243,7 +250,19 @@ class IdleRobotButtonMonitor:
         if not ROBOT_SCRIPT.is_file() or not ROBOT_PYTHON.is_file():
             print(f"[GPIO22 ERROR] 起動ファイルがありません: {ROBOT_SCRIPT} / {ROBOT_PYTHON}")
             return False
-        command = [str(ROBOT_PYTHON), "-u", str(ROBOT_SCRIPT), "--lcd-mode", "map"]
+        command = [
+            str(ROBOT_PYTHON), "-u", str(ROBOT_SCRIPT),
+            "--lcd-mode", "map",
+            "--web-port", ROBOT_WEB_PORT,
+            "--color-camera", ROBOT_CAMERA_DEVICE,
+            "--camera-fps", ROBOT_CAMERA_FPS,
+            "--webrtc-fps", ROBOT_WEBRTC_FPS,
+        ]
+        if not ROBOT_CAMERA_OCR:
+            command.append("--no-ocr")
+        print(f"[GPIO22] カメラ統合版起動: {ROBOT_SCRIPT} "
+              f"Web=:{ROBOT_WEB_PORT}, camera={ROBOT_CAMERA_DEVICE}, "
+              f"fps={ROBOT_CAMERA_FPS}, OCR={'on' if ROBOT_CAMERA_OCR else 'off'}")
         try:
             if os.geteuid() == 0 and shutil.which("systemd-run"):
                 unit = f"robocup-robot-button-{int(time.time())}-{os.getpid()}"
